@@ -1,0 +1,654 @@
+#include "main.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#define CS_LOW()       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET)
+#define CS_HIGH()      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET)
+#define ENABLE_DRV()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET)
+#define DISABLE_DRV()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET)
+#define XTARGET_REG     0xAD
+#define XACTUAL_REG     0x21 // CORRECT Read Address for Actual Position
+#define VACTUAL_REG     0x22 // CORRECT Read Address for Actual Velocity
+#define AS5600_ADDRESS (0x36 << 1)
+#define AS5600_REG_ZPOS_H   0x01
+#define AS5600_REG_ZPOS_L   0x02
+
+// Define the GPIO pin and port for the status LED
+#define STATUS_LED_PORT GPIOA
+#define STATUS_LED_PIN  GPIO_PIN_5
+#define PID_MIN_STEP   5     // minimum microstep correction
+#define PID_STABLE_CNT 5     // number of stable cycles before lock
+// AS5600 Register Addresses
+#define AS5600_ADDRESS (0x36 << 1) // 0x6C 8-bit address
+#define AS5600_REG_RAW_ANGLE_H 0x0C // Raw Angle High Byte
+#define AS5600_REG_ANGLE_H     0x0E // Scaled Angle High Byte
+#define ENC_COUNTS_PER_REV 4096
+
+/* ================= PID CONFIG ================= */
+
+// Encoder
+#define ENCODER_CPR 4096
+
+// Motor
+#define MICROSTEPS_PER_REV (200 * 256)   // 51200
+static int32_t encoder_zero = 0;
+// PID gains (START SAFE)
+float Kp = 0.04f;
+float Ki = 0.0000f;
+float Kd = 0.001f;
+
+// PID state
+float pid_integral = 0;
+float pid_prev_error = 0;
+
+// Limits
+#define PID_OUT_LIMIT  2000    // max microsteps per update
+#define ERROR_DEADBAND 3       // encoder counts
+/* ===== OPTION A: FAST PID TUNING ===== */ 
+#define PID_FAST_ZONE     100    // encoder counts 
+#define PID_FAST_STEP     80     // microsteps when error is large 
+#define PID_MED_STEP      30     // microsteps for medium error 
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+I2C_HandleTypeDef hi2c1;
+DMA_HandleTypeDef hdma_i2c1_rx;
+DMA_HandleTypeDef hdma_i2c1_tx;
+SPI_HandleTypeDef hspi1;
+UART_HandleTypeDef huart2;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+static uint8_t pid_stable_counter = 0;
+uint16_t AS5600_ReadAngleRegister(uint8_t RegAddr);
+static HAL_StatusTypeDef tmc5160_send40(uint8_t *bytes5, uint8_t *rx5);
+HAL_StatusTypeDef tmc5160_write_reg(uint8_t addr_with_writebit, uint32_t data);
+HAL_StatusTypeDef tmc5160_read_reg(uint8_t addr_no_writebit, uint32_t *out);
+void tmc5160_init(void);
+/* USER CODE END PM */
+
+uint16_t AS5600_ReadAngleRegister(uint8_t RegAddr)
+{
+    uint8_t data[2] = {0};
+    uint16_t angle = 0;
+
+    // 1. Send the register address to read from (Memory Address)
+    HAL_StatusTypeDef status = HAL_I2C_Master_Transmit(
+        &hi2c1,
+        AS5600_ADDRESS,
+        &RegAddr,
+        1,
+        100
+    );
+
+    if (status != HAL_OK) {
+        // Handle error (optional: print error, return 0, etc.)
+        return 0;
+    }
+
+    // 2. Read two bytes (High Byte and Low Byte)
+    status = HAL_I2C_Master_Receive(
+        &hi2c1,
+        AS5600_ADDRESS,
+        data,
+        2,
+        100
+    );
+
+    if (status == HAL_OK)
+    {
+        // Combine the two bytes into a 16-bit value.
+        // The AS5600 uses a 12-bit output (0-4095), where the 4 MSBs of the High Byte are zero.
+        angle = (uint16_t)((data[0] << 8) | data[1]);
+        angle &= 0x0FFF; // Mask to ensure only the 12 relevant bits are kept
+    }
+    return angle;
+}
+
+void AS5600_WriteRegister(uint8_t reg, uint8_t value)
+{
+    uint8_t buf[2];
+    buf[0] = reg;
+    buf[1] = value;
+    HAL_I2C_Master_Transmit(
+        &hi2c1,
+        AS5600_ADDRESS,
+        buf,
+        2,
+        100    );
+}
+
+void AS5600_SetZeroPosition(void)
+{
+    // Read current physical angle
+	uint16_t raw = AS5600_ReadAngleRegister(AS5600_REG_RAW_ANGLE_H);// Split 12-bit value into ZPOS registers
+	uint8_t zpos_h = (raw >> 8) & 0x0F;  // upper 4 bits
+	uint8_t zpos_l = raw & 0xFF;         // lower 8 bits// Write zero position
+	AS5600_WriteRegister(AS5600_REG_ZPOS_H, zpos_h);
+    AS5600_WriteRegister(AS5600_REG_ZPOS_L, zpos_l);
+    HAL_Delay(2); // allow internal update
+
+}
+
+void uart_print(char *msg)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}
+
+/* -------- SIGNED READ INT -------- */
+int32_t tmc_read_int(uint32_t addr)
+{
+    uint32_t raw = 0;
+    tmc5160_read_reg(addr, &raw);
+    return (int32_t)raw;  // auto sign-extension
+}
+
+/* -------- LOW LEVEL SPI 5 BYTE -------- */
+static HAL_StatusTypeDef tmc5160_send40(uint8_t *bytes5, uint8_t *rx5)
+{
+    HAL_StatusTypeDef st;
+    CS_HIGH();
+    HAL_Delay(1);
+    CS_LOW();
+    __NOP(); __NOP();
+    st = HAL_SPI_TransmitReceive(&hspi1, bytes5, rx5, 5, 100);
+    CS_HIGH();
+    HAL_Delay(1);
+
+    return st;
+}
+
+/* -------- WRITE REGISTER -------- */
+HAL_StatusTypeDef tmc5160_write_reg(uint8_t addr_with_writebit, uint32_t data)
+{
+    uint8_t tx[5], rx[5];
+    tx[0] = addr_with_writebit;
+    tx[1] = (data >> 24) & 0xFF;
+    tx[2] = (data >> 16) & 0xFF;
+    tx[3] = (data >> 8)  & 0xFF;
+    tx[4] = data & 0xFF;
+    return tmc5160_send40(tx, rx);
+}
+
+/* -------- READ REGISTER -------- */
+HAL_StatusTypeDef tmc5160_read_reg(uint8_t addr_no_writebit, uint32_t *out)
+{
+    uint8_t tx1[5] = { addr_no_writebit, 0,0,0,0 };
+    uint8_t tx2[5] = { 0,0,0,0,0 };
+    uint8_t rx1[5], rx2[5];
+    HAL_StatusTypeDef st;
+    st = tmc5160_send40(tx1, rx1);
+    if (st != HAL_OK) return st;
+    HAL_Delay(1);
+    st = tmc5160_send40(tx2, rx2);
+    if (st != HAL_OK) return st;
+    *out = ((uint32_t)rx2[1] << 24) |
+           ((uint32_t)rx2[2] << 16) |
+           ((uint32_t)rx2[3] << 8)  |
+           ((uint32_t)rx2[4]);
+    return HAL_OK;
+}
+
+/* -------- TMC5160 INIT -------- */
+void tmc5160_init(void)
+{
+    DISABLE_DRV();
+    HAL_Delay(10);
+    tmc5160_write_reg(0x01, 0x00000007);   // CLEAR GSTAT
+    HAL_Delay(2);
+    tmc5160_write_reg(0x90, 0x00061F0A);   // IHOLD/IRUN
+    HAL_Delay(2);
+    tmc5160_write_reg(0xEC, 0x000100c3);   // CHOPCONF
+    HAL_Delay(2);
+    tmc5160_write_reg(0xA4, 1000);
+    tmc5160_write_reg(0xA5, 50000);
+    tmc5160_write_reg(0xA6, 500);
+    tmc5160_write_reg(0xA7, 200000);
+    tmc5160_write_reg(0xA8, 700);
+    tmc5160_write_reg(0xAA, 1400);
+    tmc5160_write_reg(0xAB, 10);
+    tmc5160_write_reg(0xA0, 0x00000000);   // RAMPMODE
+    tmc5160_write_reg(0xAD, 51200);           // XTARGET
+    HAL_Delay(10);
+    ENABLE_DRV();
+    HAL_Delay(10);
+}
+int32_t encoder_read_corrected(void)
+{
+    int32_t raw = AS5600_ReadAngleRegister(AS5600_REG_RAW_ANGLE_H);
+
+    /* Apply software zero */int32_t val = raw - encoder_zero;
+
+    /* Wrap into 0–4095 */if (val < 0) val += 4096;
+
+    /* Direction inversion (KEEP because you need it) */    val = 4095 - val;
+
+    return val;   // 0..4095, PID safe
+    }
+int32_t encoder_error(int32_t target, int32_t current)
+{
+    int32_t err = target - current;
+
+    if (err > 2048)  err -= 4096;
+    if (err < -2048) err += 4096;
+
+    return err;
+}
+int32_t pid_compute(int32_t error)
+{
+    // Deadband handling
+    if (abs(error) <= ERROR_DEADBAND)
+    {
+        pid_integral = 0;
+        pid_prev_error = error;
+        return 0;
+    }
+
+    pid_integral += error;
+    float derivative = error - pid_prev_error;
+
+    float out =
+        (Kp * error) +
+        (Ki * pid_integral) +
+        (Kd * derivative);
+
+    // Force minimum correction if error exists
+    if (out > 0 && out < PID_MIN_STEP)  out = PID_MIN_STEP;
+    if (out < 0 && out > -PID_MIN_STEP) out = -PID_MIN_STEP;
+
+    // Clamp
+    if (out > PID_OUT_LIMIT)  out = PID_OUT_LIMIT;
+    if (out < -PID_OUT_LIMIT) out = -PID_OUT_LIMIT;
+
+    pid_prev_error = error;
+
+    return (int32_t)out;
+}
+int main(void)
+{
+
+
+  HAL_Init();
+  uint16_t angle_counts = 0;
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_SPI1_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  uart_print("TMC5160 Init...\r\n");
+  uart_print("STM32G474RE AS5600 Detector Initialized.\r\n");
+  CS_HIGH();
+  DISABLE_DRV();
+  HAL_Delay(20);
+  tmc5160_init();
+  tmc5160_write_reg(0xAD, (uint32_t)0);
+  HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(
+      &hi2c1,             // I2C handle structure (from MX_I2C1_Init)
+      AS5600_ADDRESS,     // The 8-bit I2C slave address
+      2,                  // Number of trials/retries
+      100                 // Timeout in ms
+  );
+  if (status == HAL_OK)
+    {
+        // SUCCESS INDICATION: AS5600 is connected and ACKed the address.
+	  uart_print("SUCCESS: AS5600 Encoder Detected and Ready!\r\n");
+	  encoder_zero = AS5600_ReadAngleRegister(AS5600_REG_RAW_ANGLE_H);
+	  uart_print("AS5600 Software Zero Captured\r\n");
+	  //AS5600_SetZeroPosition();
+	  //uart_print("AS5600 Zero Position Set\r\n");
+        // Turn the Status LED ON solid
+    }
+    else
+    {
+        // FAILURE INDICATION: Device not found or communication failed.
+    	uart_print("ERROR: AS5600 Encoder Not Found. Check wiring.\r\n");
+        // Turn the Status LED OFF
+    }
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  /* ================= USER MAIN LOOP ================= */
+
+  /* ---- TARGET CONFIG (SET ONCE) ---- */
+  int32_t target_angle_deg = 90;
+  int32_t target_encoder  = (target_angle_deg * ENCODER_CPR) / 360;
+  int32_t target_position = (target_angle_deg * MICROSTEPS_PER_REV) / 360;
+
+  while (1)
+  {
+      char msg[150];
+
+      /* =====================================================
+       * OPEN LOOP MOVE (TMC5160 does coarse positioning)
+       * ===================================================== */
+      uart_print(">>> OPEN LOOP MOVE START <<<\r\n");
+      tmc5160_write_reg(XTARGET_REG | 0x80, target_position);
+
+      /* Wait until motor stops */
+      while (tmc_read_int(VACTUAL_REG) != 0)
+      {
+          int32_t enc = encoder_read_corrected();
+          float deg = (enc * 360.0f) / ENCODER_CPR;
+
+          sprintf(msg, "ENC=%ld ANG=%.2f\r\n", enc, deg);
+          uart_print(msg);
+
+          HAL_Delay(10);
+      }
+
+      uart_print(">>> OPEN LOOP MOVE DONE <<<\r\n");
+
+      /* =====================================================
+       * PID POSITION TRIM (ENCODER BASED)
+       * ===================================================== */
+      uart_print(">>> PID TRIM START <<<\r\n");
+
+      while (1)
+      {
+          int32_t current_encoder = encoder_read_corrected();
+          int32_t error = encoder_error(target_encoder, current_encoder);
+
+          int32_t x_actual = tmc_read_int(XACTUAL_REG);
+          int32_t pid_step = pid_compute(error);
+
+          int32_t new_xtarget = x_actual + pid_step;
+          tmc5160_write_reg(XTARGET_REG | 0x80, new_xtarget);
+
+          sprintf(msg,
+              "ENC=%ld ERR=%ld PID=%ld XT=%ld\r\n",
+              current_encoder,
+              error,
+              pid_step,
+              new_xtarget
+          );
+          uart_print(msg);
+
+          if (abs(error) <= ERROR_DEADBAND)
+          {
+              pid_stable_counter++;
+
+              if (pid_stable_counter >= PID_STABLE_CNT)
+              {
+                  uart_print(">>> PID LOCKED <<<\r\n");
+                  pid_stable_counter = 0;
+                  break;
+              }
+          }else{
+              pid_stable_counter = 0;
+          }
+
+          HAL_Delay(10);   // 100 Hz PID
+      }
+
+      /* =====================================================
+       * HOLD POSITION (NO NESTED LOOPS)
+       * ===================================================== */
+      uart_print(">>> HOLDING POSITION <<<\r\n");
+      HAL_Delay(3000);   // Hold torque for 3 seconds
+
+      /* ---- Optional: stop after one cycle ---- */
+      // break;
+  }
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00503D58;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    /* IMPORTANT: TMC5160 wants SPI MODE 3 (CPOL=1, CPHA=1) */
+    hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;   /* was LOW, changed to HIGH */
+    hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 7;
+    hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+    hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6|GPIO_PIN_7, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PB6 PB7 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
